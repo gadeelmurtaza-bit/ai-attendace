@@ -1,105 +1,109 @@
+import cv2
 import os
 import pickle
-from PIL import Image
 import numpy as np
-import face_recognition
-import pandas as pd
-import zipfile, io, csv
+from PIL import Image
+import urllib.request
 from datetime import datetime
+import pandas as pd
 
-ASSETS_DIR = "assets"
-ENCODING_FILE = "encodings.pkl"
+ASSETS = "assets"
+os.makedirs(ASSETS, exist_ok=True)
 
-os.makedirs(ASSETS_DIR, exist_ok=True)
+ENC_FILE = "encodings.pkl"
 
-def image_to_encoding(img):
-    rgb = np.array(img.convert("RGB"))
-    encs = face_recognition.face_encodings(rgb)
-    return encs[0] if len(encs) else None
+# ----------- DOWNLOAD MODEL -----------
+def download_model(url, path):
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(url, path)
+
+# SFace model
+download_model(
+    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/master/sface/face_recognition_sface_2021dec.onnx",
+    "sface.onnx"
+)
+
+# Face detector
+download_model(
+    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/master/face_detection_yunet/yunet.onnx",
+    "yunet.onnx"
+)
+
+detector = cv2.FaceDetectorYN.create("yunet.onnx", "", (320, 320), 0.9, 0.3, 5000)
+recognizer = cv2.FaceRecognizerSF.create("sface.onnx", "")
+
+
+# ----------- ENCODING -----------
+def get_encoding(pil):
+    img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    h, w = img.shape[:2]
+    detector.setInputSize((w, h))
+
+    faces = detector.detect(img)
+    if faces[1] is None:
+        return None
+
+    face = faces[1][0:4]
+    aligned = recognizer.alignCrop(img, face)
+    feat = recognizer.feature(aligned)
+    return feat
 
 
 def load_encodings():
-    if not os.path.exists(ENCODING_FILE):
+    if not os.path.exists(ENC_FILE):
         return {}
-    return pickle.load(open(ENCODING_FILE, "rb"))
+    return pickle.load(open(ENC_FILE, "rb"))
 
 
 def save_encodings(data):
-    pickle.dump(data, open(ENCODING_FILE, "wb"))
+    pickle.dump(data, open(ENC_FILE, "wb"))
 
 
-def register_student(name, roll, img):
-    enc = image_to_encoding(img)
+# ----------- REGISTRATION -----------
+def register_student(name, roll, pil):
+    enc = get_encoding(pil)
     if enc is None:
         return False, "No face detected"
 
-    path = os.path.join(ASSETS_DIR, f"{roll}.jpg")
-    img.save(path)
+    path = f"{ASSETS}/{roll}.jpg"
+    pil.save(path)
 
     data = load_encodings()
     data[roll] = {"name": name, "photo": path, "encoding": enc}
     save_encodings(data)
+
     return True, "Registered"
 
 
-def register_bulk(zip_bytes):
-    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    if "mapping.csv" not in zf.namelist():
-        return False, "mapping.csv missing"
-
-    mapping = pd.read_csv(io.BytesIO(zf.read("mapping.csv")))
-    data = load_encodings()
-
-    results = []
-
-    for _, row in mapping.iterrows():
-        file = row["filename"]
-        name = row["name"]
-        roll = str(row["roll"])
-
-        if file not in zf.namelist():
-            results.append([roll, False, "file missing"])
-            continue
-
-        img = Image.open(io.BytesIO(zf.read(file))).convert("RGB")
-        ok, msg = register_student(name, roll, img)
-        results.append([roll, ok, msg])
-
-    return True, results
-
-
-def find_best_match(enc, tolerance=0.55):
+# ----------- MATCHING -----------
+def match_face(enc):
     data = load_encodings()
     if not data:
         return None, None
 
-    rolls = list(data.keys())
-    stored_encs = [data[r]["encoding"] for r in rolls]
+    best_roll = None
+    best_score = -1
 
-    matches = face_recognition.compare_faces(stored_encs, enc, tolerance)
-    distances = face_recognition.face_distance(stored_encs, enc)
+    for roll, d in data.items():
+        score = recognizer.match(enc, d["encoding"], cv2.FaceRecognizerSF_FR_COSINE)
+        if score > best_score:
+            best_score = score
+            best_roll = roll
 
-    best_idx = None
-    best_dist = 999
-
-    for i, is_match in enumerate(matches):
-        if is_match and distances[i] < best_dist:
-            best_idx = i
-            best_dist = distances[i]
-
-    if best_idx is None:
+    if best_score < 0.5:
         return None, None
 
-    roll = rolls[best_idx]
-    return roll, best_dist
+    return best_roll, best_score
 
 
+# ----------- ATTENDANCE -----------
 def mark_attendance(roll, name):
     today = datetime.now().strftime("%Y-%m-%d")
     file = f"attendance_{today}.csv"
     exists = os.path.exists(file)
 
     with open(file, "a", newline="") as f:
+        import csv
         writer = csv.writer(f)
         if not exists:
             writer.writerow(["timestamp", "roll", "name"])
