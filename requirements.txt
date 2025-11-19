@@ -1,6 +1,6 @@
 streamlit
-opencv-python
-opencv-contrib-python
+deepface
 Pillow
 numpy
 pandas
+tensorflow-cpu==2.15
